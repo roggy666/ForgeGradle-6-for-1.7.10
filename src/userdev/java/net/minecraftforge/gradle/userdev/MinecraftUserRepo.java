@@ -414,6 +414,7 @@ public class MinecraftUserRepo extends BaseRepo {
                 }
             }
             loadedParents = mcp != null;
+        } else {
         }
         return parent;
     }
@@ -467,6 +468,9 @@ public class MinecraftUserRepo extends BaseRepo {
 
     private HashStore commonHash(@Nullable File mapping) {
         getParents();
+        if (mcp == null) {
+            throw new IllegalStateException("MCP is null after getParents() - this should not happen");
+        }
         HashStore ret = new HashStore(this.getCacheRoot());
         ret.add(mcp.artifact.getDescriptor(), mcp.getZip());
         Patcher patcher = parent;
@@ -606,8 +610,14 @@ public class MinecraftUserRepo extends BaseRepo {
         }
 
         File bin = cacheMapped(mapping, "jar");
-        cache.load(cacheMapped(mapping, "jar.input"));
-        if (cache.isSame() && bin.exists()) {
+        try {
+            cache.load(cacheMapped(mapping, "jar.input"));
+        } catch (Throwable t) {
+            throw t;
+        }
+        boolean isSame = cache.isSame();
+        boolean binExists = bin.exists();
+        if (isSame && binExists) {
             debug("  Finding Raw: Cache Hit: " + bin);
         } else {
             debug("  Finding Raw: Cache Miss");
@@ -627,7 +637,8 @@ public class MinecraftUserRepo extends BaseRepo {
             File srged = findBinpatched(packages);
 
             File mcinject;
-            if (mcp.wrapper.getConfig().isOfficial()) {
+            boolean isOfficial = mcp.wrapper.getConfig().isOfficial();
+            if (isOfficial) {
                 mcinject = srged;
             } else {
                 mcinject = cacheRaw("mci", "jar");
@@ -650,72 +661,90 @@ public class MinecraftUserRepo extends BaseRepo {
             if (!inject_src.getParentFile().exists() && !inject_src.getParentFile().mkdirs())
                 throw new RuntimeException("Could not create directory: " + inject_src.getParentFile().getAbsolutePath());
 
-            try (ZipInputStream zin = new ZipInputStream(new FileInputStream(mcp.getZip()));
-                 ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(inject_src)) ) {
-                String prefix = mcp.wrapper.getConfig().getData("inject");
-                String template = null;
-                ZipEntry entry;
-                while ((entry = zin.getNextEntry()) != null) {
-                    if (!entry.getName().startsWith(prefix) || entry.isDirectory())
-                        continue;
+            // Inject prefix can come from MCP config (modern) or from Patcher (legacy 1.7.10)
+            String prefix = mcp.wrapper.getConfig().getData("inject");
+            File injectZip = mcp.getZip();
+            if (prefix == null && parent != null) {
+                prefix = parent.getInject();
+                injectZip = parent.getZip();
+            }
 
-                    // If an entry has a specific side in its name, don't apply
-                    // it when we're on the opposite side. Entries without a specific
-                    // side should always be applied
-                    if ("server".equals(NAME) && entry.getName().contains("/client/")) {
-                        continue;
+            File injected;
+            boolean hasInjectSources = false;
+            if (prefix != null) {
+                try (ZipInputStream zin = new ZipInputStream(new FileInputStream(injectZip));
+                     ZipOutputStream zos = new ZipOutputStream(new FileOutputStream(inject_src)) ) {
+                    String template = null;
+                    ZipEntry entry;
+                    while ((entry = zin.getNextEntry()) != null) {
+                        if (!entry.getName().startsWith(prefix) || entry.isDirectory())
+                            continue;
+
+                        // If an entry has a specific side in its name, don't apply
+                        // it when we're on the opposite side. Entries without a specific
+                        // side should always be applied
+                        if ("server".equals(NAME) && entry.getName().contains("/client/")) {
+                            continue;
+                        }
+
+                        if ("client".equals(NAME) && entry.getName().contains("/server/")) {
+                            continue;
+                        }
+
+                        String name = entry.getName().substring(prefix.length());
+                        if ("package-info-template.java".equals(name)) {
+                            template = new String(IOUtils.toByteArray(zin), StandardCharsets.UTF_8);
+                        } else {
+                            hasInjectSources = true;
+                            zos.putNextEntry(Utils.getStableEntry(name));
+                            IOUtils.copy(zin, zos);
+                            zos.closeEntry();
+                        }
                     }
 
-                    if ("client".equals(NAME) && entry.getName().contains("/server/")) {
-                        continue;
-                    }
-
-                    String name = entry.getName().substring(prefix.length());
-                    if ("package-info-template.java".equals(name)) {
-                        template = new String(IOUtils.toByteArray(zin), StandardCharsets.UTF_8);
-                    } else {
-                        zos.putNextEntry(Utils.getStableEntry(name));
-                        IOUtils.copy(zin, zos);
-                        zos.closeEntry();
-                    }
-                }
-
-                if (template != null) {
-                    for (String pkg : packages) {
-                        zos.putNextEntry(Utils.getStableEntry(pkg + "/package-info.java"));
-                        zos.write(template.replace("{PACKAGE}", pkg.replace("/", ".")).getBytes(StandardCharsets.UTF_8));
-                        zos.closeEntry();
+                    if (template != null) {
+                        for (String pkg : packages) {
+                            hasInjectSources = true;
+                            zos.putNextEntry(Utils.getStableEntry(pkg + "/package-info.java"));
+                            zos.write(template.replace("{PACKAGE}", pkg.replace("/", ".")).getBytes(StandardCharsets.UTF_8));
+                            zos.closeEntry();
+                        }
                     }
                 }
             }
 
-            debug("    Compiling MCP Inject sources");
-            File compiled = compileJava(inject_src, mcinject);
-            if (compiled == null)
-                return null;
+            if (hasInjectSources) {
+                debug("    Compiling MCP Inject sources");
+                File compiled = compileJava(inject_src, mcinject);
+                if (compiled == null)
+                    return null;
 
-            debug("    Injecting MCP Inject binairies");
-            File injected = cacheRaw("injected", "jar");
-            //Combine mci, and our recompiled MCP injected classes.
-            try (ZipInputStream zmci = new ZipInputStream(new FileInputStream(mcinject));
-                 ZipOutputStream zout = new ZipOutputStream(new FileOutputStream(injected))) {
-                ZipEntry entry = null;
-                while ((entry = zmci.getNextEntry()) != null) {
-                    zout.putNextEntry(Utils.getStableEntry(entry.getName()));
-                    IOUtils.copy(zmci, zout);
-                    zout.closeEntry();
-                }
-                Files.walkFileTree(compiled.toPath(), new SimpleFileVisitor<Path>() {
-                    @Override
-                    public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                        try (InputStream fin = Files.newInputStream(file)) {
-                            zout.putNextEntry(Utils.getStableEntry(compiled.toPath().relativize(file).toString().replace('\\', '/')));
-                            IOUtils.copy(fin, zout);
-                            zout.closeEntry();
-                        }
-                        return FileVisitResult.CONTINUE;
+                debug("    Injecting MCP Inject binairies");
+                injected = cacheRaw("injected", "jar");
+                //Combine mci, and our recompiled MCP injected classes.
+                try (ZipInputStream zmci = new ZipInputStream(new FileInputStream(mcinject));
+                     ZipOutputStream zout = new ZipOutputStream(new FileOutputStream(injected))) {
+                    ZipEntry entry = null;
+                    while ((entry = zmci.getNextEntry()) != null) {
+                        zout.putNextEntry(Utils.getStableEntry(entry.getName()));
+                        IOUtils.copy(zmci, zout);
+                        zout.closeEntry();
                     }
-                });
+                    Files.walkFileTree(compiled.toPath(), new SimpleFileVisitor<Path>() {
+                        @Override
+                        public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                            try (InputStream fin = Files.newInputStream(file)) {
+                                zout.putNextEntry(Utils.getStableEntry(compiled.toPath().relativize(file).toString().replace('\\', '/')));
+                                IOUtils.copy(fin, zout);
+                                zout.closeEntry();
+                            }
+                            return FileVisitResult.CONTINUE;
+                        }
+                    });
+                }
+            } else {
+                // No inject sources (legacy 1.7.10 or empty inject folder), use mcinject directly
+                injected = mcinject;
             }
 
             if (hasAts) {
@@ -731,11 +760,24 @@ public class MinecraftUserRepo extends BaseRepo {
                     File parentAT = project.file("build/" + at.getName() + "/parent_at.cfg");
                     if (!parentAT.getParentFile().exists())
                         parentAT.getParentFile().mkdirs();
-                    Files.write(parentAT.toPath(), baseAT.toString().getBytes(StandardCharsets.UTF_8));
+                    // For pre-1.13 versions, convert legacy AT format (dots) to modern format (slashes)
+                    String atContent = baseAT.toString();
+                    MinecraftVersion mcver = MinecraftVersion.from(VERSION.split("-")[0]);
+                    if (mcver.compareTo(v1_13) < 0) {
+                        atContent = convertLegacyATFormat(atContent);
+                    }
+                    Files.write(parentAT.toPath(), atContent.getBytes(StandardCharsets.UTF_8));
                     at.getAccessTransformers().from(parentAT);
                 }
 
-                at.apply();
+                try {
+                    at.apply();
+                } catch (Throwable t) {
+                    java.io.StringWriter sw = new java.io.StringWriter();
+                    t.printStackTrace(new java.io.PrintWriter(sw));
+                    project.getLogger().lifecycle(sw.toString());
+                    throw t;
+                }
             }
 
             debug("    Renaming/Fixing " + (hasAts ? "ATed" : "injected") + " jar");
@@ -1015,6 +1057,109 @@ public class MinecraftUserRepo extends BaseRepo {
         }
 
         return srg;
+    }
+
+    /**
+     * Convert legacy (pre-1.13) Access Transformer format to modern format.
+     * Legacy format uses dots in class names (net.minecraft.block.Block),
+     * while modern format uses slashes (net/minecraft/block/Block).
+     * Also converts method descriptors from dots to slashes and fixes
+     * incomplete method descriptors (missing return type).
+     */
+    private String convertLegacyATFormat(String atContent) {
+        StringBuilder result = new StringBuilder();
+        for (String line : atContent.split("\n")) {
+            String trimmed = line.trim();
+            // Skip empty lines and comments
+            if (trimmed.isEmpty() || trimmed.startsWith("#")) {
+                result.append(line).append("\n");
+                continue;
+            }
+
+            // Parse the AT line: <modifier> <class> [<member> [<descriptor>]]
+            // Examples:
+            //   public net.minecraft.block.Block <init>(Lnet/minecraft/src/Material;)V
+            //   public net.minecraft.item.ItemPickaxe <init>(Lnet.minecraft.item.Item$ToolMaterial;)
+            //   public net.minecraft.entity.player.EntityPlayer func_71012_a(Lnet/minecraft/entity/item/EntityItem;)V
+
+            String[] parts = trimmed.split("\\s+", 3);
+            if (parts.length < 2) {
+                // Malformed line, keep as-is
+                result.append(line).append("\n");
+                continue;
+            }
+
+            String modifier = parts[0];
+            String className = parts[1].replace('.', '/');
+
+            if (parts.length == 2) {
+                // Just modifier and class (e.g., "public net.minecraft.block.Block")
+                // Or class with wildcard (e.g., "public net.minecraft.block.Block *")
+                result.append(modifier).append(" ").append(className).append("\n");
+            } else {
+                // Has member/descriptor
+                String rest = parts[2];
+                // Convert any dots in type descriptors (L...;) to slashes
+                // The descriptor is everything inside Lxxx; patterns
+                rest = convertDescriptorDots(rest);
+                // Fix incomplete method descriptors - legacy AT sometimes omits return type
+                rest = fixIncompleteDescriptor(rest);
+                result.append(modifier).append(" ").append(className).append(" ").append(rest).append("\n");
+            }
+        }
+        return result.toString();
+    }
+
+    /**
+     * Fix incomplete method descriptors that are missing the return type.
+     * Legacy 1.7.10 AT files sometimes have descriptors like "(Lsome/Type;)" without return type.
+     * Constructors always return void (V), and if a descriptor ends with ) without a return type,
+     * we assume it's a constructor and add V.
+     */
+    private String fixIncompleteDescriptor(String input) {
+        // Check if this looks like a method with descriptor: something(...)
+        // If descriptor ends with ) and no return type, add V for constructors
+        int parenOpen = input.indexOf('(');
+        int parenClose = input.indexOf(')');
+        if (parenOpen >= 0 && parenClose > parenOpen) {
+            // There's a descriptor. Check what follows the closing paren
+            String afterParen = input.substring(parenClose + 1);
+            // afterParen should start with return type descriptor (V, I, J, F, D, Z, B, C, S, L...; or [)
+            // If it's empty or starts with a space/# (comment), the return type is missing
+            if (afterParen.isEmpty() || afterParen.startsWith(" ") || afterParen.startsWith("#")) {
+                // Missing return type - insert V (void) which is typical for constructors
+                return input.substring(0, parenClose + 1) + "V" + afterParen;
+            }
+        }
+        return input;
+    }
+
+    /**
+     * Convert dots to slashes inside JVM type descriptors.
+     * Handles patterns like Lnet.minecraft.block.Block; -> Lnet/minecraft/block/Block;
+     */
+    private String convertDescriptorDots(String input) {
+        StringBuilder result = new StringBuilder();
+        int i = 0;
+        while (i < input.length()) {
+            char c = input.charAt(i);
+            if (c == 'L') {
+                // Start of object type descriptor
+                int semicolon = input.indexOf(';', i);
+                if (semicolon > i) {
+                    String typeName = input.substring(i + 1, semicolon);
+                    result.append('L').append(typeName.replace('.', '/')).append(';');
+                    i = semicolon + 1;
+                } else {
+                    result.append(c);
+                    i++;
+                }
+            } else {
+                result.append(c);
+                i++;
+            }
+        }
+        return result.toString();
     }
 
     private IMappingFile loadObfToSrg(byte[] data) throws IOException {

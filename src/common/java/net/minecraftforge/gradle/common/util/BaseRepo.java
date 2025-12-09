@@ -87,7 +87,13 @@ public abstract class BaseRepo implements ArtifactProvider<ArtifactIdentifier> {
             return Artifact.none();
         } catch (Throwable e) {
             //Catch everything so we don't error up in gradle and fuck up the internals so it never asks us for anything ever again!
-            log.lifecycle("Error getting artifact: " + clean(artifact) + " from  " + REPO_NAME, e);
+            log.lifecycle("Error getting artifact: " + clean(artifact) + " from  " + REPO_NAME);
+            e.fillInStackTrace();
+            StackTraceElement[] stack = e.getStackTrace();
+            log.lifecycle("Stack trace has " + stack.length + " elements:");
+            for (StackTraceElement el : stack) {
+                log.lifecycle("  " + el.toString());
+            }
             return Artifact.none();
         }
     }
